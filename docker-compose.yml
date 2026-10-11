@@ -1,0 +1,29 @@
+# Local development dependencies only.
+# This Compose file provisions PostgreSQL for local development. The API and
+# web apps are run with local commands, not in Compose.
+#
+# Usage:
+#   docker compose up -d postgres
+#
+# Values are read from the local .env file (copy from .env.example first).
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: meal-platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-meal_platform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-meal_platform}
+      POSTGRES_DB: ${POSTGRES_DB:-meal_platform}
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - meal_platform_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-meal_platform} -d ${POSTGRES_DB:-meal_platform}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  meal_platform_pgdata:

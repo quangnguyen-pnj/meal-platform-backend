@@ -1,0 +1,29 @@
+# Dependencies
+/node_modules
+
+# Build output
+/dist
+
+# Prisma generated client (regenerate with `npm run prisma:generate`)
+/src/generated
+
+# Sandbox-only placeholder used to bypass the blocked Prisma engine CDN
+/.fake-schema-engine
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# Test coverage
+/coverage

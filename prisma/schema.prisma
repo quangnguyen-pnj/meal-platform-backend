@@ -1,0 +1,847 @@
+// Prisma schema for meal-platform-api.
+//
+// Phase 0-2 domain tables are introduced in later tasks (F0-03 onwards).
+// This foundation keeps a single HealthCheck table so that `prisma migrate`
+// produces a real, non-empty migration and the connection can be verified
+// end to end.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Minimal table used to prove the database connection and migrations work.
+/// Kept alongside the Phase 0 schema so the health endpoint has a trivial
+/// table to query.
+model HealthCheck {
+  id        String   @id @default(uuid())
+  checkedAt DateTime @default(now())
+
+  @@map("health_check")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 0 enums
+// ---------------------------------------------------------------------------
+
+/// Status of an employee spreadsheet import job. Only the Phase 0 lifecycle is
+/// modelled here; menu/session/registration enums arrive in later phases.
+enum ImportJobStatus {
+  UPLOADED
+  VALIDATED
+  COMMITTED
+  FAILED
+}
+
+/// Validation state of a single parsed row inside an import job.
+enum ImportRowStatus {
+  PENDING
+  VALID
+  INVALID
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 enums
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of a factory's weekly menu (P1-02). A menu is edited while DRAFT,
+/// locked once PUBLISHED, and retired as ARCHIVED. Meal sessions (P1-03) are
+/// derived from a PUBLISHED menu.
+enum WeeklyMenuStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+/// The meal a menu item (and later a session) belongs to. Phase 1 ships LUNCH
+/// and DINNER only; breakfast is out of scope until a requirement calls for it.
+enum MealType {
+  LUNCH
+  DINNER
+}
+
+/// Lifecycle of a meal session (P1-03). A session is created DRAFT from a
+/// published weekly menu, PUBLISHED once its opening and cutoff times are set,
+/// OPEN while diners may register, CLOSED after cutoff, or CANCELLED. The
+/// registration window is NOT a background job: `MealSessionAccess` derives it
+/// on demand from `status`, `opensAt`, and `cutoffAt` relative to the current
+/// instant, so a session past its `cutoffAt` reports closed even if no job ran.
+enum MealSessionStatus {
+  DRAFT
+  PUBLISHED
+  OPEN
+  CLOSED
+  CANCELLED
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 enums
+// ---------------------------------------------------------------------------
+
+/// Status of a single diner's registration for a session (P2-01). A new
+/// registration is REGISTERED; it becomes CANCELLED if withdrawn or ABSENT if
+/// the diner was marked a no-show. The unique `(mealSessionId, employeeId)`
+/// keeps exactly one registration row per employee per session regardless of
+/// status, so status transitions reuse the same row.
+enum RegistrationStatus {
+  REGISTERED
+  CANCELLED
+  ABSENT
+}
+
+/// How a registration (or batch) was created (P2-01). SELF is a diner acting on
+/// their own registration; BULK and PAPER_FORM come from a representative/admin
+/// batch; ADMIN_ADJUSTMENT is a post-cutoff change by an authorised admin.
+enum RegistrationSource {
+  SELF
+  BULK
+  PAPER_FORM
+  ADMIN_ADJUSTMENT
+}
+
+/// The kind of change recorded in a registration's own history (P2-01). This
+/// drives `RegistrationChange`, which is per-registration history and is NOT
+/// the system-level `AuditLog`; neither is an event stream.
+enum RegistrationChangeKind {
+  CREATED
+  DISH_CHANGED
+  CANCELLED
+  ABSENT
+  POST_CUTOFF_ADJUSTMENT
+}
+
+/// Lifecycle of a registration batch (P2-01). A BULK or PAPER_FORM batch is
+/// built while DRAFT, becomes COMMITTED once its entries are applied as
+/// registrations, or REJECTED if validation fails and nothing is written.
+enum RegistrationBatchStatus {
+  DRAFT
+  COMMITTED
+  REJECTED
+}
+
+/// Validation/apply state of a single batch entry (P2-01), mirroring the
+/// import-row pattern: an entry is PENDING until validated, VALID when it may be
+/// committed, INVALID when it carries row errors, and COMMITTED once it has
+/// produced a registration.
+enum RegistrationBatchEntryStatus {
+  PENDING
+  VALID
+  INVALID
+  COMMITTED
+}
+
+/// Status of a reserve allocation (P2-01). An allocation is ALLOCATED until it
+/// is CANCELLED. Reserve allocations are separate from ordinary registrations:
+/// allocating reserve to someone does not create a `MealRegistration`.
+enum ReserveAllocationStatus {
+  ALLOCATED
+  CANCELLED
+}
+
+// ---------------------------------------------------------------------------
+// Tenant tree: Organization -> Factory -> Department -> Team -> Employee
+// ---------------------------------------------------------------------------
+
+/// Top of the tenant tree. Every business row is ultimately scoped to one
+/// organization.
+model Organization {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  factories   Factory[]
+  departments Department[]
+  teams       Team[]
+  employees   Employee[]
+  roles       Role[]
+  userRoles   UserRole[]
+  auditLogs   AuditLog[]
+  importJobs   EmployeeImportJob[]
+  dishes       Dish[]
+  weeklyMenus  WeeklyMenu[]
+  mealSessions MealSession[]
+  mealRegistrations   MealRegistration[]
+  registrationBatches RegistrationBatch[]
+  reserveAllocations  ReserveAllocation[]
+
+  @@map("organization")
+}
+
+model Factory {
+  id             String   @id @default(uuid())
+  organizationId String
+  code           String
+  name           String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  departments  Department[]
+  teams        Team[]
+  employees    Employee[]
+  userRoles    UserRole[]
+  weeklyMenus  WeeklyMenu[]
+  mealSessions MealSession[]
+  registrationBatches RegistrationBatch[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@map("factory")
+}
+
+model Department {
+  id             String   @id @default(uuid())
+  organizationId String
+  factoryId      String
+  code           String
+  name           String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  factory      Factory      @relation(fields: [factoryId], references: [id], onDelete: Cascade)
+  teams        Team[]
+  employees    Employee[]
+  userRoles    UserRole[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@index([factoryId])
+  @@map("department")
+}
+
+/// A team under a department under a factory. Containment (a team's
+/// departmentId must belong to the same factory as its factoryId, and an
+/// employee's factory/department/team must agree) is enforced in the services,
+/// which are the only writers in Phase 0 (see OrganizationsService.createTeam
+/// and WorkforceService.resolvePlacement). It is NOT enforced at the database
+/// level: there are no composite foreign keys tying these columns together, so
+/// a raw write or a future code path could create an inconsistent subtree.
+///
+/// This stays service-enforced for Phase 0 deliberately. Composite FKs would
+/// require composite unique keys on the parent rows (for example
+/// `@@unique([id, factoryId])` on Department and Team) and composite relations,
+/// a schema change this environment cannot author or verify offline (the Prisma
+/// engine CDN is blocked, so `prisma migrate dev` cannot run). The plan favours
+/// keeping Phase 0 simple over a half-applied migration.
+///
+/// TODO(phase-1): move containment into the database with composite foreign
+/// keys once CI can run a real Postgres to author and apply the migration.
+model Team {
+  id             String   @id @default(uuid())
+  organizationId String
+  factoryId      String
+  departmentId   String
+  code           String
+  name           String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  factory      Factory      @relation(fields: [factoryId], references: [id], onDelete: Cascade)
+  department   Department   @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  employees    Employee[]
+  userRoles    UserRole[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@index([departmentId])
+  @@map("team")
+}
+
+/// A workforce member. Keeps current factory/department/team foreign keys for
+/// fast scoped filtering; services verify the tree is consistent before
+/// writing (containment is checked in later tasks). A worker without a
+/// personal device has no linked UserAccount.
+model Employee {
+  id               String   @id @default(uuid())
+  organizationId   String
+  factoryId        String
+  departmentId     String
+  teamId           String
+  employeeCode     String
+  fullName         String
+  email            String?
+  hasPersonalDevice Boolean @default(false)
+  userAccountId    String?  @unique
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  factory      Factory      @relation(fields: [factoryId], references: [id], onDelete: Restrict)
+  department   Department   @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  team         Team         @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  userAccount  UserAccount? @relation(fields: [userAccountId], references: [id], onDelete: SetNull)
+
+  mealRegistrations     MealRegistration[]
+  reserveAllocations    ReserveAllocation[]
+  registrationBatchEntries RegistrationBatchEntry[]
+
+  @@unique([organizationId, employeeCode])
+  @@index([organizationId])
+  @@index([factoryId])
+  @@index([departmentId])
+  @@index([teamId])
+  @@map("employee")
+}
+
+// ---------------------------------------------------------------------------
+// Identity, authorization, audit
+// ---------------------------------------------------------------------------
+
+/// A login account. Local accounts carry an Argon2id password hash; federated
+/// accounts carry one or more ExternalIdentity rows and may have no local
+/// password hash.
+model UserAccount {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  employee           Employee?
+  externalIdentities ExternalIdentity[]
+  userRoles          UserRole[]
+  refreshSessions    RefreshSession[]
+  auditLogs          AuditLog[]
+
+  @@map("user_account")
+}
+
+/// Link between a UserAccount and an external identity provider subject. The
+/// local provider does not create these; they exist so Enterprise SSO can be
+/// added later without a schema change.
+model ExternalIdentity {
+  id            String   @id @default(uuid())
+  userAccountId String
+  provider      String
+  subject       String
+  createdAt     DateTime @default(now())
+
+  userAccount UserAccount @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, subject])
+  @@index([userAccountId])
+  @@map("external_identity")
+}
+
+/// A named role within an organization that bundles permissions.
+model Role {
+  id             String   @id @default(uuid())
+  organizationId String
+  code           String
+  name           String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization    Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  rolePermissions RolePermission[]
+  userRoles       UserRole[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@map("role")
+}
+
+/// A permission code. Permissions are global catalog entries referenced by
+/// roles; enforcement logic arrives in F0-05.
+model Permission {
+  id          String   @id @default(uuid())
+  code        String   @unique
+  description String
+  createdAt   DateTime @default(now())
+
+  rolePermissions RolePermission[]
+
+  @@map("permission")
+}
+
+/// Join table binding a Role to the Permissions it grants.
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permission")
+}
+
+/// A scoped grant: a UserAccount holds a Role at exactly one scope level
+/// (organization OR factory OR department OR team). Prisma cannot express the
+/// "exactly one scope target" rule, so the migration adds a CHECK constraint
+/// (user_role_single_scope) enforcing it at the database level.
+model UserRole {
+  id             String   @id @default(uuid())
+  userAccountId  String
+  roleId         String
+  organizationId String
+  factoryId      String?
+  departmentId   String?
+  teamId         String?
+  createdAt      DateTime @default(now())
+
+  userAccount  UserAccount  @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+  role         Role         @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  factory      Factory?     @relation(fields: [factoryId], references: [id], onDelete: Cascade)
+  department   Department?  @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  team         Team?        @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([userAccountId, roleId, organizationId, factoryId, departmentId, teamId])
+  @@index([userAccountId])
+  @@index([roleId])
+  @@index([organizationId])
+  @@map("user_role")
+}
+
+/// A refresh-token session. Rotation and revocation logic arrive in F0-04;
+/// the schema stores the hashed token, expiry, and revocation marker now.
+model RefreshSession {
+  id            String    @id @default(uuid())
+  userAccountId String
+  tokenHash     String    @unique
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  createdAt     DateTime  @default(now())
+
+  userAccount UserAccount @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+
+  @@index([userAccountId])
+  @@map("refresh_session")
+}
+
+/// System-level audit trail. Separate from registration change history; this
+/// is not an event stream. Actor may be null for system-originated actions.
+model AuditLog {
+  id             String   @id @default(uuid())
+  organizationId String
+  actorId        String?
+  action         String
+  entityType     String
+  entityId       String
+  details        Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actor        UserAccount? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@map("audit_log")
+}
+
+// ---------------------------------------------------------------------------
+// Employee import
+// ---------------------------------------------------------------------------
+
+/// A single upload of an employee spreadsheet. Rows are validated as a unit;
+/// an invalid file never writes partial employee data (apply logic in P0-04).
+model EmployeeImportJob {
+  id             String          @id @default(uuid())
+  organizationId String
+  status         ImportJobStatus @default(UPLOADED)
+  originalFilename String
+  uploadedById   String?
+  rowCount       Int             @default(0)
+  errorCount     Int             @default(0)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  rows         EmployeeImportRow[]
+
+  @@index([organizationId])
+  @@map("employee_import_job")
+}
+
+/// One parsed spreadsheet row inside an import job, with its raw values and
+/// validation outcome. `email` is kept exactly as supplied; it is never
+/// derived from the name.
+model EmployeeImportRow {
+  id             String          @id @default(uuid())
+  importJobId    String
+  rowNumber      Int
+  employeeCode   String?
+  fullName       String?
+  email          String?
+  factoryCode    String?
+  departmentCode String?
+  teamCode       String?
+  hasPersonalDevice Boolean?
+  status         ImportRowStatus @default(PENDING)
+  errors         Json?
+  createdAt      DateTime        @default(now())
+
+  importJob EmployeeImportJob @relation(fields: [importJobId], references: [id], onDelete: Cascade)
+
+  @@unique([importJobId, rowNumber])
+  @@index([importJobId])
+  @@map("employee_import_row")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: menu catalog
+// ---------------------------------------------------------------------------
+
+/// A dish in the organization-level catalog (P1-01). Dishes are not tied to a
+/// factory: a weekly menu (P1-02) and meal session (P1-03) reference them. The
+/// catalog is configurable data, not a fixed set of five dishes. `category` is
+/// an optional free-text grouping (for example "chay" / "chao"); `dietaryTags`
+/// is an optional list of tags. A disabled dish keeps `isActive = false` rather
+/// than being deleted, because later menus and session history may reference
+/// it; P1-02/P1-03 are what stop a disabled dish being added to a new session.
+model Dish {
+  id             String   @id @default(uuid())
+  organizationId String
+  code           String
+  name           String
+  description    String?
+  category       String?
+  dietaryTags    String[] @default([])
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization     Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  menuItems        MenuItem[]
+  mealSessionDishes MealSessionDish[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@map("dish")
+}
+
+/// A factory's menu for one week (P1-02). A factory has at most ONE menu per
+/// `weekStartDate` (the Monday of the week in Asia/Ho_Chi_Minh time), enforced
+/// by the unique `[factoryId, weekStartDate]`. `organizationId` is denormalised
+/// for tenant filtering and audit, consistent with the other business tables.
+///
+/// The menu is edited while DRAFT (add/remove/reorder items), then PUBLISHED,
+/// which records `publishedAt` and `publishedByUserId`. A published menu is
+/// what P1-03 turns into meal sessions; nothing here creates sessions. ARCHIVED
+/// retires a menu. Items can only change while DRAFT.
+model WeeklyMenu {
+  id                String           @id @default(uuid())
+  organizationId    String
+  factoryId         String
+  weekStartDate     DateTime         @db.Date
+  status            WeeklyMenuStatus @default(DRAFT)
+  publishedAt       DateTime?
+  publishedByUserId String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  factory      Factory       @relation(fields: [factoryId], references: [id], onDelete: Cascade)
+  items        MenuItem[]
+  mealSessions MealSession[]
+
+  @@unique([factoryId, weekStartDate])
+  @@index([organizationId])
+  @@index([factoryId])
+  @@map("weekly_menu")
+}
+
+/// One dish offered on a specific service date and meal type within a weekly
+/// menu (P1-02). `serviceDate` must fall inside the menu's week; `mealType` is
+/// LUNCH or DINNER. The unique `[weeklyMenuId, serviceDate, mealType, dishId]`
+/// stops the same dish being added twice to the same slot. A dish referenced
+/// here is not cascade-deleted when disabled: `onDelete: Restrict` keeps the
+/// catalog row while the item exists, and the service only blocks adding an
+/// inactive dish, not keeping one already added.
+model MenuItem {
+  id           String   @id @default(uuid())
+  weeklyMenuId String
+  serviceDate  DateTime @db.Date
+  mealType     MealType
+  dishId       String
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  weeklyMenu WeeklyMenu @relation(fields: [weeklyMenuId], references: [id], onDelete: Cascade)
+  dish       Dish       @relation(fields: [dishId], references: [id], onDelete: Restrict)
+
+  @@unique([weeklyMenuId, serviceDate, mealType, dishId])
+  @@index([weeklyMenuId])
+  @@index([dishId])
+  @@map("menu_item")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: meal sessions
+// ---------------------------------------------------------------------------
+
+/// A single meal a factory serves on one `serviceDate` and `mealType` (P1-03).
+/// Unique `[factoryId, serviceDate, mealType]` guarantees one session per
+/// factory/date/meal. A session is derived from a PUBLISHED weekly menu
+/// (`weeklyMenuId`): its offered dishes come from that menu's items for the
+/// matching service date and meal, copied into `MealSessionDish`.
+/// `weeklyMenuId` is nullable so the column survives a menu being removed, but
+/// the service only ever creates a session from a published menu.
+///
+/// `serviceDate` is a calendar day in Asia/Ho_Chi_Minh time (date-only).
+/// `opensAt` and `cutoffAt` are instants (stored UTC): registration is allowed
+/// from `opensAt` until `cutoffAt`. The window is evaluated on demand by
+/// `MealSessionAccess` from `status` + these two instants relative to the
+/// current time, so correctness does NOT depend on a background close worker.
+/// An admin close/sync command may set `status = CLOSED` for display, but a
+/// session whose `cutoffAt` has passed already reports closed.
+///
+/// `reservePoolSize` on `MealSessionDish` is reserved for Phase 2 reserve
+/// pools; it is added now so Phase 2 needs no migration and is left unused and
+/// null in Phase 1 (no reserve logic lives here).
+model MealSession {
+  id                String            @id @default(uuid())
+  organizationId    String
+  factoryId         String
+  weeklyMenuId      String?
+  serviceDate       DateTime          @db.Date
+  mealType          MealType
+  status            MealSessionStatus @default(DRAFT)
+  opensAt           DateTime
+  cutoffAt          DateTime
+  publishedAt       DateTime?
+  publishedByUserId String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  factory      Factory           @relation(fields: [factoryId], references: [id], onDelete: Cascade)
+  weeklyMenu   WeeklyMenu?       @relation(fields: [weeklyMenuId], references: [id], onDelete: SetNull)
+  dishes       MealSessionDish[]
+  registrations      MealRegistration[]
+  reserveAllocations ReserveAllocation[]
+  batchEntries       RegistrationBatchEntry[]
+
+  @@unique([factoryId, serviceDate, mealType])
+  @@index([organizationId])
+  @@index([factoryId])
+  @@index([weeklyMenuId])
+  @@map("meal_session")
+}
+
+/// A dish a diner may pick for a meal session (P1-03), carried over from the
+/// weekly menu item for that session's service date and meal. The unique
+/// `[mealSessionId, dishId]` stops a dish appearing twice in one session, and
+/// this is the "dish/session" uniqueness the P2-01 completion criterion names.
+///
+/// `reservePoolSize` was a Phase 1 placeholder for the reserve pool quantity.
+/// Phase 2 (P2-01) moves reserve configuration into its own `ReservePoolSetting`
+/// row (1:1 with this dish, default off) so the on/off flag and quantity live
+/// together; the column is left in place to avoid rewriting the P1-03 migration
+/// but is no longer the source of truth and stays null. New reserve logic
+/// (P2-10) reads `ReservePoolSetting`.
+model MealSessionDish {
+  id              String   @id @default(uuid())
+  mealSessionId   String
+  dishId          String
+  sortOrder       Int      @default(0)
+  reservePoolSize Int?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  mealSession MealSession @relation(fields: [mealSessionId], references: [id], onDelete: Cascade)
+  dish        Dish        @relation(fields: [dishId], references: [id], onDelete: Restrict)
+
+  registrations      MealRegistration[]
+  reservePoolSetting ReservePoolSetting?
+  reserveAllocations ReserveAllocation[]
+  batchEntries       RegistrationBatchEntry[]
+
+  @@unique([mealSessionId, dishId])
+  @@index([mealSessionId])
+  @@index([dishId])
+  @@map("meal_session_dish")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: registrations, batches, change history, reserve pool
+// ---------------------------------------------------------------------------
+
+/// One diner's registration for a meal session (P2-01). The unique
+/// `[mealSessionId, employeeId]` guarantees exactly one registration per
+/// employee per session (the "unique employee/session" completion criterion);
+/// status transitions (REGISTERED -> CANCELLED/ABSENT) reuse this row rather
+/// than inserting a second one. `mealSessionDishId` is the dish the diner
+/// chose for the session.
+///
+/// `registrationBatchId` is set when the row came from a BULK or PAPER_FORM
+/// batch and is null for a SELF registration. `createdByUserId` /
+/// `updatedByUserId` record who acted (an admin/representative for a batch, the
+/// diner's own account for SELF). `adjustmentReason` holds the required reason
+/// for a post-cutoff adjustment (P2-08). No registration business rules live in
+/// the schema; this task only lands the table and its constraints.
+model MealRegistration {
+  id                  String             @id @default(uuid())
+  organizationId      String
+  mealSessionId       String
+  employeeId          String
+  mealSessionDishId   String
+  status              RegistrationStatus @default(REGISTERED)
+  source              RegistrationSource
+  registrationBatchId String?
+  adjustmentReason    String?
+  createdByUserId     String
+  updatedByUserId     String?
+  registeredAt        DateTime           @default(now())
+  cancelledAt         DateTime?
+  absentAt            DateTime?
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  organization    Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  mealSession     MealSession        @relation(fields: [mealSessionId], references: [id], onDelete: Cascade)
+  employee        Employee           @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  mealSessionDish MealSessionDish    @relation(fields: [mealSessionDishId], references: [id], onDelete: Restrict)
+  batch           RegistrationBatch? @relation(fields: [registrationBatchId], references: [id], onDelete: SetNull)
+  changes         RegistrationChange[]
+
+  @@unique([mealSessionId, employeeId])
+  @@index([organizationId])
+  @@index([mealSessionId])
+  @@index([employeeId])
+  @@index([registrationBatchId])
+  @@map("meal_registration")
+}
+
+/// A representative/admin batch of registrations (P2-01), used for BULK entry
+/// (P2-04) and PAPER_FORM entry (P2-06). A batch is validated as a unit: it
+/// stays DRAFT while entries are built and checked, becomes COMMITTED once its
+/// entries are applied as registrations, or REJECTED when validation fails and
+/// nothing is written. `paperReference` stores the paper form's reference or a
+/// note (no scan/OCR); `reason` is an optional free-text note. The committed
+/// `MealRegistration` rows link back via `registrationBatchId`.
+model RegistrationBatch {
+  id              String                  @id @default(uuid())
+  organizationId  String
+  factoryId       String
+  source          RegistrationSource
+  status          RegistrationBatchStatus @default(DRAFT)
+  reason          String?
+  paperReference  String?
+  createdByUserId String
+  submittedAt     DateTime?
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+
+  organization  Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  factory       Factory                  @relation(fields: [factoryId], references: [id], onDelete: Cascade)
+  entries       RegistrationBatchEntry[]
+  registrations MealRegistration[]
+
+  @@index([organizationId])
+  @@index([factoryId])
+  @@map("registration_batch")
+}
+
+/// A single preview/entry row inside a registration batch (P2-01), kept
+/// separate from the committed `MealRegistration` so bulk and paper-form flows
+/// can preview and show per-row errors before anything is written (P2-04,
+/// P2-06). `rowNumber` orders paper-form rows; `errors` carries structured
+/// validation messages for an INVALID entry, mirroring `EmployeeImportRow`.
+model RegistrationBatchEntry {
+  id                  String                        @id @default(uuid())
+  registrationBatchId String
+  employeeId          String
+  mealSessionId       String
+  mealSessionDishId   String?
+  rowNumber           Int?
+  status              RegistrationBatchEntryStatus  @default(PENDING)
+  errors              Json?
+  createdAt           DateTime                      @default(now())
+  updatedAt           DateTime                      @updatedAt
+
+  batch           RegistrationBatch @relation(fields: [registrationBatchId], references: [id], onDelete: Cascade)
+  employee        Employee          @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  mealSession     MealSession       @relation(fields: [mealSessionId], references: [id], onDelete: Cascade)
+  mealSessionDish MealSessionDish?  @relation(fields: [mealSessionDishId], references: [id], onDelete: SetNull)
+
+  @@index([registrationBatchId])
+  @@index([employeeId])
+  @@index([mealSessionId])
+  @@map("registration_batch_entry")
+}
+
+/// Per-registration history (P2-01), separate from the system-level `AuditLog`
+/// and NOT an event stream. One row records a single change to a registration:
+/// `kind` says what happened, `before`/`after` hold JSON snapshots, `reason`
+/// is the required justification for a post-cutoff adjustment (P2-08), and
+/// `actorUserId` is who made the change.
+model RegistrationChange {
+  id                 String                 @id @default(uuid())
+  mealRegistrationId String
+  kind               RegistrationChangeKind
+  before             Json?
+  after              Json?
+  reason             String?
+  actorUserId        String?
+  occurredAt         DateTime               @default(now())
+
+  mealRegistration MealRegistration @relation(fields: [mealRegistrationId], references: [id], onDelete: Cascade)
+
+  @@index([mealRegistrationId])
+  @@map("registration_change")
+}
+
+/// Reserve pool configuration for one session dish (P2-01). Modelled as a
+/// separate table (1:1 with `MealSessionDish`, unique `mealSessionDishId`) per
+/// the plan: reserve is off by default and uses a FIXED `quantity` per session
+/// dish. P2-10 enables it before cutoff and allocates against it after cutoff.
+/// This replaces the Phase 1 `MealSessionDish.reservePoolSize` placeholder as
+/// the source of truth for reserve configuration.
+model ReservePoolSetting {
+  id                String   @id @default(uuid())
+  mealSessionDishId String   @unique
+  isEnabled         Boolean  @default(false)
+  quantity          Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  mealSessionDish MealSessionDish @relation(fields: [mealSessionDishId], references: [id], onDelete: Cascade)
+
+  @@map("reserve_pool_setting")
+}
+
+/// A reserve allocation against a session dish (P2-01). Reserve allocations are
+/// independent from ordinary registrations: allocating reserve to an employee
+/// does NOT create a `MealRegistration`. `employeeId` is the recipient when
+/// known (nullable for an unassigned reserve). `quantity` defaults to 1. P2-10
+/// enforces that allocations never exceed the pool's configured quantity under
+/// a transaction; this task only lands the table.
+model ReserveAllocation {
+  id                String                  @id @default(uuid())
+  organizationId    String
+  mealSessionId     String
+  mealSessionDishId String
+  employeeId        String?
+  quantity          Int                     @default(1)
+  status            ReserveAllocationStatus @default(ALLOCATED)
+  reason            String?
+  allocatedByUserId String
+  allocatedAt       DateTime                @default(now())
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+
+  organization    Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  mealSession     MealSession     @relation(fields: [mealSessionId], references: [id], onDelete: Cascade)
+  mealSessionDish MealSessionDish @relation(fields: [mealSessionDishId], references: [id], onDelete: Cascade)
+  employee        Employee?       @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([mealSessionId])
+  @@index([mealSessionDishId])
+  @@index([employeeId])
+  @@map("reserve_allocation")
+}
