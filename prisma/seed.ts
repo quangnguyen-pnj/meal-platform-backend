@@ -14,6 +14,9 @@
 import * as argon2 from 'argon2';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../src/generated/prisma/client';
+import { loadEnvFile } from './load-env-file';
+
+loadEnvFile();
 
 const ORG_CODE = 'PNJP';
 

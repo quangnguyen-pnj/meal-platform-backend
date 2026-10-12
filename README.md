@@ -1,13 +1,54 @@
-# meal-platform-api
+# meal-platform-backend
 
 Backend API for the factory meal management platform. NestJS + TypeScript,
 PostgreSQL via Prisma 7, REST/JSON. All routes are served under the `/v1`
 prefix.
 
-This repository is the API half of a two-repository system (`meal-platform-api`
-and `meal-platform-web`). The API is the only place that enforces authorization,
-scope, cutoff rules, and transactions. See `../planning/implementation-plan.md`
-for the full plan.
+This repository is the API half of a two-repository system. The frontend lives
+in `meal-platform-frontend`. The API is the only place that enforces
+authorization, scope, cutoff rules, and transactions.
+
+## Quick start (backend and frontend)
+
+Clone both repositories into the same parent folder, then run these steps in
+order. You need Node.js 20.12 or later, npm, and Docker.
+
+```bash
+git clone https://github.com/quangnguyen-pnj/meal-platform-backend.git
+git clone https://github.com/quangnguyen-pnj/meal-platform-frontend.git
+```
+
+1. Start PostgreSQL and prepare the backend (port 3000):
+
+   ```bash
+   cd meal-platform-backend
+   cp .env.example .env
+   docker compose up -d postgres
+   npm install
+   npm run prisma:generate
+   npm run prisma:migrate
+   npm run prisma:seed
+   npm run start:dev
+   ```
+
+   `prisma:migrate` and `prisma:seed` read `DATABASE_URL` and `SEED_PASSWORD`
+   from `.env`. The seed password in `.env.example` is for local use only.
+
+2. In a second terminal, start the frontend (port 3001):
+
+   ```bash
+   cd meal-platform-frontend
+   cp .env.example .env
+   npm install
+   npm run dev
+   ```
+
+3. Open <http://localhost:3001> and log in with a seeded account, for example
+   `lan.tt01@pnj.com.vn`, using the `SEED_PASSWORD` value from the backend
+   `.env`. See [Phase 0 seed data](#phase-0-seed-data) for every account.
+
+If `docker compose` is not available, start PostgreSQL with
+`docker run -d --name meal-platform-postgres -e POSTGRES_USER=meal_platform -e POSTGRES_PASSWORD=meal_platform -e POSTGRES_DB=meal_platform -p 5432:5432 postgres:17-alpine`.
 
 ## Requirements
 
