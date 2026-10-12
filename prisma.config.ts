@@ -1,4 +1,7 @@
 import { defineConfig, env } from '@prisma/config';
+import { loadEnvFile } from './prisma/load-env-file';
+
+loadEnvFile();
 
 /**
  * Prisma 7 config.
