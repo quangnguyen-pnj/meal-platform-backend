@@ -30,6 +30,6 @@ import { LocalIdentityProvider } from './local-identity-provider';
     LocalIdentityProvider,
     { provide: IDENTITY_PROVIDER, useExisting: LocalIdentityProvider },
   ],
-  exports: [JwtAuthGuard],
+  exports: [JwtAuthGuard, JwtModule],
 })
 export class AuthModule {}
